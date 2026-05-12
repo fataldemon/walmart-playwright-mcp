@@ -10,13 +10,11 @@
 import { request } from 'undici';
 import UserAgent from 'user-agents';
 import { randomBytes, randomInt } from 'node:crypto';
-// 浏览器 fallback：当 HTTP 拿不到 _pxvid 时，用真实浏览器渲染获取
-let _browserGetterPromise = null;
-async function _getBrowserLazy(proxy) {
-  if (!_browserGetterPromise) {
-    _browserGetterPromise = import('./browser.js').then(m => m.getBrowser({ headless: true, proxy }));
-  }
-  return _browserGetterPromise;
+// 浏览器 fallback：始终复用 browser.js 里的 getBrowser，
+// 这样可以受 server.js 当前 HEADLESS 全局变量控制（set_headless 也能生效）
+async function _getBrowserShared({ headless, proxy }) {
+  const m = await import('./browser.js');
+  return m.getBrowser({ headless, proxy });
 }
 
 const PXVID_REGEX = /_pxvid=([^;]+)/i;
@@ -131,8 +129,8 @@ export async function fetchOnePxvid({ proxy } = {}) {
 /** 浏览器 fallback：访问首页让 PerimeterX JS 自己种 _pxvid，再从 cookie 里读
  *  比 HTTP 慢，但能搞定 JS-set 的情况
  */
-export async function fetchOnePxvidViaBrowser({ proxy } = {}) {
-  const browser = await _getBrowserLazy(proxy);
+export async function fetchOnePxvidViaBrowser({ proxy, headless = true } = {}) {
+  const browser = await _getBrowserShared({ headless, proxy });
   const headers = buildRandomHeaders();
   const ua = headers['User-Agent'];
   const ctx = await browser.newContext({
@@ -190,7 +188,10 @@ export class PxvidPool {
     ttlMs = 30 * 60_000,        // 30min 强制淘汰，避免老化失效
     proxy = null,
     logger = console,
+    // 用函数形式获取 headless，使外部 set_headless 改动能即时生效
+    getHeadless = () => true,
   } = {}) {
+    this.getHeadless = getHeadless;
     this.primarySize = primarySize;
     this.secondarySize = secondarySize;
     this.activationMs = activationMs;
@@ -219,7 +220,8 @@ export class PxvidPool {
     if (httpRes.token) return httpRes;
     // 2) HTTP 拿不到 -> 浏览器 fallback（PerimeterX 经常通过 JS 种 cookie）
     try {
-      const brRes = await fetchOnePxvidViaBrowser({ proxy: this.proxy });
+      const headless = !!this.getHeadless();
+      const brRes = await fetchOnePxvidViaBrowser({ proxy: this.proxy, headless });
       if (brRes.token) return brRes;
       return { token: null, status: brRes.status, reason: `http:${httpRes.reason} | ${brRes.reason}` };
     } catch (e) {

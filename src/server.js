@@ -20,13 +20,14 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 
 import { PxvidPool } from './pxvid-pool.js';
-import { fetchWalmartPage, getBrowser, closeBrowser } from './browser.js';
+import { fetchWalmartPage, getBrowser, closeBrowser, getCurrentBrowserMode } from './browser.js';
 
-// ---------- 配置 ----------
+// ---------- 配置（运行时可变） ----------
 const PORT = parseInt(process.env.PORT || '8931', 10);
 const HOST = process.env.HOST || '0.0.0.0';
-const HEADLESS = process.env.HEADLESS !== 'false';
 const PROXY = process.env.PROXY || null;          // e.g. http://user:pass@host:port
+// HEADLESS 改为可变全局：可通过 MCP tool `set_headless` 在运行时切换
+let HEADLESS = process.env.HEADLESS !== 'false';
 const PRIMARY = parseInt(process.env.PXVID_PRIMARY || '5', 10);
 const SECONDARY = parseInt(process.env.PXVID_SECONDARY || '5', 10);
 const ACTIVATION_MS = parseInt(process.env.PXVID_ACTIVATION_MS || '10000', 10);
@@ -37,6 +38,7 @@ const pool = new PxvidPool({
   secondarySize: SECONDARY,
   activationMs: ACTIVATION_MS,
   proxy: PROXY,
+  getHeadless: () => HEADLESS,   // 让池里浏览器 fallback 跟随 set_headless
 });
 pool.start().catch(err => console.error('[pool] start error:', err));
 
@@ -109,6 +111,23 @@ function buildMcpServer() {
         },
         required: ['url'],
       },
+    },
+    {
+      name: 'set_headless',
+      description:
+        '运行时切换浏览器是否无头。true=不显示窗口；false=弹出 Chromium 窗口（仅本地非容器/非服务化运行时可见）。切换后会关闭并重启浏览器。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          headless: { type: 'boolean' },
+        },
+        required: ['headless'],
+      },
+    },
+    {
+      name: 'browser_status',
+      description: '查看当前浏览器是否在运行、当前是有头还是无头、是否配置代理',
+      inputSchema: { type: 'object', properties: {} },
     },
   ];
 
@@ -221,6 +240,20 @@ function buildMcpServer() {
           }
         }
 
+        case 'set_headless': {
+          const schema = z.object({ headless: z.boolean() });
+          const a = schema.parse(args);
+          HEADLESS = a.headless;
+          // 主动触发浏览器重启，使变更立刻可见
+          await closeBrowser();
+          await getBrowser({ headless: HEADLESS, proxy: PROXY });
+          console.log(`[server] HEADLESS set to ${HEADLESS} via MCP tool`);
+          return ok({ headless: HEADLESS, browser: getCurrentBrowserMode() });
+        }
+
+        case 'browser_status':
+          return ok({ headless: HEADLESS, ...getCurrentBrowserMode() });
+
         default:
           return err(`unknown tool: ${name}`);
       }
@@ -261,7 +294,12 @@ app.get('/', (_req, res) => {
   });
 });
 
-app.get('/healthz', (_req, res) => res.json({ ok: true, pool: pool.stats() }));
+app.get('/healthz', (_req, res) => res.json({
+  ok: true,
+  pool: pool.stats(),
+  headless: HEADLESS,
+  browser: getCurrentBrowserMode(),
+}));
 
 // SSE 端点（MCP client 连这里）
 app.get('/sse', async (req, res) => {

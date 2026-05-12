@@ -8,21 +8,46 @@ import StealthPlugin from 'puppeteer-extra-plugin-stealth';
 pwChromium.use(StealthPlugin());
 
 let _browser = null;
+let _browserHeadless = null;       // 记录当前已开启 browser 的模式
+let _browserProxy = null;
+
+export function getCurrentBrowserMode() {
+  return {
+    running: !!(_browser && _browser.isConnected()),
+    headless: _browserHeadless,
+    proxy: _browserProxy,
+  };
+}
 
 export async function getBrowser({ headless = true, proxy = null } = {}) {
-  if (_browser && _browser.isConnected()) return _browser;
+  // 若 mode 变化（比如运行时 set_headless），关旧的换新的
+  if (_browser && _browser.isConnected()) {
+    if (_browserHeadless === headless && _browserProxy === proxy) return _browser;
+    console.log(`[browser] mode changed (headless ${_browserHeadless}->${headless}), restarting...`);
+    try { await _browser.close(); } catch {}
+    _browser = null;
+  }
+  const args = [
+    '--disable-blink-features=AutomationControlled',
+    '--disable-features=IsolateOrigins,site-per-process',
+    '--no-sandbox',
+    '--disable-dev-shm-usage',
+    '--lang=en-US,en',
+  ];
+  if (!headless) {
+    args.push('--start-maximized');
+  } else {
+    args.push('--disable-gpu');
+  }
+  console.log(`[browser] launching chromium  headless=${headless}  proxy=${proxy || '<none>'}`);
   _browser = await pwChromium.launch({
     headless,
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--disable-features=IsolateOrigins,site-per-process',
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--lang=en-US,en',
-    ],
+    args,
     proxy: proxy ? { server: proxy } : undefined,
   });
+  _browserHeadless = headless;
+  _browserProxy = proxy;
+  console.log(`[browser] launched. version=${_browser.version()}  isConnected=${_browser.isConnected()}`);
   return _browser;
 }
 
