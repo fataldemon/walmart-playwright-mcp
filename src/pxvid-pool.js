@@ -205,6 +205,10 @@ export class PxvidPool {
     this.successes = 0;
     this.lastError = null;
     this.lastStatus = null;
+    // 日志节流
+    this._loopBackoffMs = 2000;
+    this._lastWarnAt = 0;
+    this._lastWarnMsg = '';
   }
 
   async start() {
@@ -229,8 +233,18 @@ export class PxvidPool {
     }
   }
 
+  // 节流的 warn：相同消息 30s 内只打一次，避免刷屏
+  _warnThrottled(msg) {
+    const now = Date.now();
+    if (msg === this._lastWarnMsg && now - this._lastWarnAt < 30_000) return;
+    this._lastWarnAt = now;
+    this._lastWarnMsg = msg;
+    this.logger.warn?.(msg);
+  }
+
   async _fill(target) {
     let consecutiveFailures = 0;
+    let hadAnySuccess = false;
     while (this.tokens.length < target && !this.stopped) {
       this.attempts += 1;
       try {
@@ -243,24 +257,26 @@ export class PxvidPool {
           this.successes += 1;
           this.lastError = null;
           consecutiveFailures = 0;
+          hadAnySuccess = true;
           setTimeout(() => { t.ready = true; }, this.activationMs).unref?.();
         } else {
           this.lastError = result.reason;
           consecutiveFailures += 1;
-          this.logger.warn?.(`[PxvidPool] no token (status=${result.status}): ${result.reason}`);
+          this._warnThrottled(`[PxvidPool] no token (status=${result.status}): ${result.reason}`);
         }
       } catch (e) {
         this.lastError = e.message;
         consecutiveFailures += 1;
-        this.logger.warn?.('[PxvidPool] fetch token failed:', e.message);
+        this._warnThrottled(`[PxvidPool] fetch token failed: ${e.message}`);
       }
-      // 连续失败时直接放弃本轮，避免死循环（典型情况：IP 被沃尔玛 block）
+      // 连续失败时直接放弃本轮，避免死循环
       if (consecutiveFailures >= 3) {
-        this.logger.warn?.('[PxvidPool] giving up _fill for now after 3 consecutive failures');
+        // 不再每轮都打印这条提示，让 _loop 的退避机制接管
         break;
       }
       await new Promise(r => setTimeout(r, 300 + Math.random() * 700));
     }
+    return hadAnySuccess;
   }
 
   async _loop() {
@@ -272,9 +288,19 @@ export class PxvidPool {
       );
       const want = this.primarySize + this.secondarySize;
       if (this.tokens.length < want) {
-        await this._fill(want);
+        const success = await this._fill(want);
+        if (success) {
+          // 有进展，重置退避
+          this._loopBackoffMs = 2000;
+        } else {
+          // 没拿到任何 token，退避翻倍，上限 60s
+          this._loopBackoffMs = Math.min(this._loopBackoffMs * 2, 60_000);
+          this._warnThrottled(`[PxvidPool] no progress, backing off to ${Math.round(this._loopBackoffMs/1000)}s`);
+        }
+      } else {
+        this._loopBackoffMs = 2000;
       }
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, this._loopBackoffMs));
     }
   }
 
