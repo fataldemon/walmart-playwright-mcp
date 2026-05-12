@@ -43,6 +43,8 @@ import {
   getBrowser,
   closeBrowser,
 } from './browser.js';
+import { extractSearchBrief, extractProductBrand, detectChallenge, ParseError } from './walmart-parse.js';
+import { humanize } from './humanize.js';
 
 // ---------- 配置 ----------
 const PORT = parseInt(process.env.PORT || '8931', 10);
@@ -73,12 +75,70 @@ let state = {
   lastFetchBlockedAt: null,
   fetchCount: 0,
   blockedCount: 0,
+  briefSuccessCount: 0,
+  briefBlockedCount: 0,
 };
+
+// ---------- 全局串行锁（保护对 walmart 的访问，避免并发触发 PX） ----------
+let _walmartChain = Promise.resolve();
+function walmartSerialize(task) {
+  const next = _walmartChain.then(() => task());
+  _walmartChain = next.catch(() => {});      // 任务异常不阻塞后续
+  return next;
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+const randBetween = (min, max) => min + Math.random() * (max - min);
+
+/** 在已 ready 的 CDP context 里抓某个 URL 并跑提取器，返回精简 JSON */
+async function runOnNewTab(url, extractor, { timeoutMs = 60000, postLandWaitMs = 1500 } = {}) {
+  if (MODE !== 'cdp') {
+    // persistent 模式 fallback：用 persistent context
+    const ctx = await getPersistentContext({
+      userDataDir: USER_DATA_DIR, headless: SERVING_HEADLESS,
+      proxy: PROXY, useLocalChrome: USE_LOCAL_CHROME,
+    });
+    const page = await ctx.newPage();
+    page.setDefaultTimeout(timeoutMs);
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+      await sleep(postLandWaitMs);
+      await humanize.afterLand(page).catch(() => {});
+      return await extractor(page);
+    } finally {
+      await page.close().catch(() => {});
+    }
+  }
+
+  const ctx = await connectToExistingChrome({ cdpUrl: CDP_URL });
+  const page = await ctx.newPage();
+  page.setDefaultTimeout(timeoutMs);
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    await sleep(postLandWaitMs);
+    await humanize.afterLand(page).catch(() => {});
+    return await extractor(page);
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+/** 把 walmart-parse 抛出的错误码转换为统一的 ok=false 响应 */
+function buildErr(query, e, extra = {}) {
+  const code = e?.code || (e?.name === 'TimeoutError' ? 'NAVIGATION_TIMEOUT' : 'UNKNOWN');
+  return {
+    ok: false,
+    errorCode: code,
+    errorMessage: e?.message || String(e),
+    ...(query !== undefined ? { query } : {}),
+    ...extra,
+  };
+}
 
 // ---------- MCP server 工厂 ----------
 function buildMcpServer() {
   const server = new Server(
-    { name: 'walmart-playwright-mcp', version: '3.0.0' },
+    { name: 'walmart-playwright-mcp', version: '3.1.0' },
     { capabilities: { tools: {} } }
   );
 
@@ -88,9 +148,48 @@ function buildMcpServer() {
       description: '查看 Walmart 抓取服务当前是否就绪',
       inputSchema: { type: 'object', properties: {} },
     },
+    // ====== ★ v3.1 新增：精简侵权排查端点 ======
+    {
+      name: 'walmart_search_brief',
+      description: '【推荐】在沃尔玛搜索关键词，返回前 N 个商品的精简结构化 JSON（标题/品牌/商家/价格/itemId/URL），专为 LLM 任务设计，比原始 HTML 节省 ~99% token。注意：搜索页 brand 字段经常为 null（这是 Walmart 行为），需要拿真实 brand 时用 walmart_product_brand。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '搜索关键词（建议取商品标题前 5-6 个有效词）' },
+          topN: { type: 'number', default: 10, description: '返回前 N 个商品，默认 10' },
+        },
+        required: ['query'],
+      },
+    },
+    {
+      name: 'walmart_search_brief_batch',
+      description: '【推荐】批量搜索：内部串行调用 walmart_search_brief，每次之间随机 sleep 3-8 秒模拟真人。任意一次返回 PX_BLOCKED / CDP_DISCONNECTED 会立即中止后续。最多 20 个 query 一批。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          queries: { type: 'array', items: { type: 'string' }, description: '搜索词数组（≤20 个）' },
+          topN: { type: 'number', default: 10 },
+          intervalMinMs: { type: 'number', default: 3000 },
+          intervalMaxMs: { type: 'number', default: 8000 },
+        },
+        required: ['queries'],
+      },
+    },
+    {
+      name: 'walmart_product_brand',
+      description: '【推荐】抓取沃尔玛商品详情页的"品牌信息"（精简 JSON）：brand / brandUrl(facet=brand:Xxx 链接) / sellerDisplayName。约 300 字节。专为侵权排查的"品牌核对"步骤设计。',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          url: { type: 'string', description: '完整商品 URL（如 https://www.walmart.com/ip/.../12345）' },
+          itemId: { type: 'string', description: '或仅提供 itemId' },
+        },
+      },
+    },
+    // ====== v3.0 原有工具（返回完整 HTML，慎用） ======
     {
       name: 'walmart_search',
-      description: '在沃尔玛搜索关键词，返回搜索结果 HTML',
+      description: '【慢/费 token】在沃尔玛搜索关键词，返回完整搜索结果 HTML',
       inputSchema: {
         type: 'object',
         properties: {
@@ -102,7 +201,7 @@ function buildMcpServer() {
     },
     {
       name: 'walmart_product',
-      description: '抓取沃尔玛单个商品页（接受完整 URL 或 itemId）',
+      description: '【慢/费 token】抓取沃尔玛单个商品页（完整 HTML）',
       inputSchema: {
         type: 'object',
         properties: {
@@ -113,7 +212,7 @@ function buildMcpServer() {
     },
     {
       name: 'walmart_fetch',
-      description: '抓取任意 walmart.com 页面',
+      description: '抓取任意 walmart.com 页面（完整 HTML/text/json）',
       inputSchema: {
         type: 'object',
         properties: {
@@ -170,6 +269,128 @@ function buildMcpServer() {
             warmedUpOnDisk: isWarmedUp(USER_DATA_DIR),
           });
 
+        // ====== ★ v3.1 精简端点 ======
+        case 'walmart_search_brief': {
+          const a = z.object({
+            query: z.string().min(1),
+            topN: z.number().int().min(1).max(40).default(10),
+          }).parse(args);
+
+          if (state.status !== 'ready') {
+            return ok(buildErr(a.query, { code: 'SERVICE_NOT_READY', message: `status=${state.status}` }));
+          }
+
+          const url = `https://www.walmart.com/search?q=${encodeURIComponent(a.query)}`;
+          try {
+            const result = await walmartSerialize(async () => {
+              return await runOnNewTab(url, (page) => extractSearchBrief(page, { topN: a.topN }));
+            });
+            state.briefSuccessCount += 1;
+            state.lastFetchOk = true;
+            return ok({ ok: true, query: a.query, url, ...result });
+          } catch (e) {
+            if (e?.code === ParseError.PX_BLOCKED) {
+              state.briefBlockedCount += 1;
+              state.blockedCount += 1;
+              state.lastFetchBlockedAt = new Date().toISOString();
+              state.status = 'blocked';
+            }
+            return ok(buildErr(a.query, e, { url }));
+          }
+        }
+
+        case 'walmart_search_brief_batch': {
+          const a = z.object({
+            queries: z.array(z.string().min(1)).min(1).max(20),
+            topN: z.number().int().min(1).max(40).default(10),
+            intervalMinMs: z.number().int().min(0).default(3000),
+            intervalMaxMs: z.number().int().min(0).default(8000),
+          }).parse(args);
+          const lo = Math.min(a.intervalMinMs, a.intervalMaxMs);
+          const hi = Math.max(a.intervalMinMs, a.intervalMaxMs);
+
+          if (state.status !== 'ready') {
+            return ok({
+              ok: false,
+              errorCode: 'SERVICE_NOT_READY',
+              errorMessage: `status=${state.status}`,
+              results: [],
+            });
+          }
+
+          const results = [];
+          let abortedAt = null;
+          for (let i = 0; i < a.queries.length; i++) {
+            const q = a.queries[i];
+            const url = `https://www.walmart.com/search?q=${encodeURIComponent(q)}`;
+            try {
+              const r = await walmartSerialize(async () => {
+                return await runOnNewTab(url, (page) => extractSearchBrief(page, { topN: a.topN }));
+              });
+              state.briefSuccessCount += 1;
+              state.lastFetchOk = true;
+              results.push({ ok: true, query: q, url, ...r });
+            } catch (e) {
+              const errPayload = buildErr(q, e, { url });
+              results.push(errPayload);
+              if (e?.code === ParseError.PX_BLOCKED) {
+                state.briefBlockedCount += 1;
+                state.blockedCount += 1;
+                state.lastFetchBlockedAt = new Date().toISOString();
+                state.status = 'blocked';
+                abortedAt = i;
+                break;
+              }
+              if (e?.code === 'CDP_DISCONNECTED' || /disconnected|target.*closed/i.test(e?.message || '')) {
+                abortedAt = i;
+                break;
+              }
+            }
+            // 随机 sleep（最后一个 query 不 sleep）
+            if (i < a.queries.length - 1) {
+              await sleep(randBetween(lo, hi));
+            }
+          }
+          return ok({
+            ok: results.every(r => r.ok),
+            total: a.queries.length,
+            done: results.length,
+            aborted: abortedAt !== null,
+            abortedAt,
+            results,
+          });
+        }
+
+        case 'walmart_product_brand': {
+          const a = z.object({
+            url: z.string().url().optional(),
+            itemId: z.string().optional(),
+          }).refine(v => v.url || v.itemId, { message: 'url or itemId required' }).parse(args);
+
+          if (state.status !== 'ready') {
+            return ok(buildErr(undefined, { code: 'SERVICE_NOT_READY', message: `status=${state.status}` }));
+          }
+
+          const url = a.url || `https://www.walmart.com/ip/${a.itemId}`;
+          try {
+            const result = await walmartSerialize(async () => {
+              return await runOnNewTab(url, (page) => extractProductBrand(page));
+            });
+            state.briefSuccessCount += 1;
+            state.lastFetchOk = true;
+            return ok({ ok: true, requestedUrl: url, ...result });
+          } catch (e) {
+            if (e?.code === ParseError.PX_BLOCKED) {
+              state.briefBlockedCount += 1;
+              state.blockedCount += 1;
+              state.lastFetchBlockedAt = new Date().toISOString();
+              state.status = 'blocked';
+            }
+            return ok(buildErr(undefined, e, { requestedUrl: url }));
+          }
+        }
+
+        // ====== v3.0 原有工具 ======
         case 'walmart_search': {
           const a = z.object({
             query: z.string(),
@@ -308,7 +529,7 @@ app.use(express.json({ limit: '4mb' }));
 const transports = new Map();
 
 app.get('/', (_req, res) => {
-  res.json({ name: 'walmart-playwright-mcp', version: '3.0.0', transport: 'sse', sse: '/sse', state });
+  res.json({ name: 'walmart-playwright-mcp', version: '3.1.0', transport: 'sse', sse: '/sse', state });
 });
 
 app.get('/healthz', (_req, res) => res.json({
@@ -336,7 +557,7 @@ app.post('/messages', async (req, res) => {
 
 // ---------- 启动序列 ----------
 (async () => {
-  console.log(`[walmart-playwright-mcp] starting v3.0.0...`);
+  console.log(`[walmart-playwright-mcp] starting v3.1.0...`);
   console.log(`[config] mode=${MODE}  cdpUrl=${CDP_URL}  userDataDir=${USER_DATA_DIR}`);
 
   app.listen(PORT, HOST, () => {

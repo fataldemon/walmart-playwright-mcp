@@ -1,7 +1,117 @@
-# walmart-playwright-mcp · v3 CDP 接管版
+# walmart-playwright-mcp · v3.1 CDP 接管 + 精简侵权排查端点
 
 > 一个**本地部署**的 Playwright MCP 服务，专门用于绕过 **Walmart (PerimeterX)** 的人机验证。
 > 通过 SSE 暴露在 `http://host.docker.internal:8931/sse`，可直接接入 Dify / Cline / Claude Desktop 等 MCP Client。
+
+---
+
+## ★ v3.1 新增：精简结构化端点（强烈推荐使用）
+
+v3.0 的 `walmart_search` / `walmart_product` 返回**完整 HTML**（一次 200KB+），扔给 LLM 既慢又烧 token。
+v3.1 新增 3 个**专为 dify/LLM 工作流**设计的端点，返回 JSON、**节省 98% token**：
+
+| 工具 | 输入 | 输出大小（实测） | 用途 |
+| --- | --- | --- | --- |
+| `walmart_search_brief` | `query`, `topN`（默认 10）| ~900 B/item × 10 ≈ 9 KB | **搜索 + 提取前 10 商品**：title, brand, **seller** (★关键), price, itemId, productUrl, rating, sponsored... |
+| `walmart_search_brief_batch` | `queries[]`（≤20）| 上面 × N | **批量搜索**：内部串行 + 每次随机 sleep 3-8s + 任意 PX_BLOCKED 立即中止 |
+| `walmart_product_brand` | `url` 或 `itemId` | ~700 B | **详情页品牌核对**：brand, **brandUrl**（`/browse/0?facet=brand:Xxx` 完整链接）, sellerDisplayName, sellerLegalName |
+
+### 字段说明（重要）
+
+- **搜索页的 `brand` 字段经常为 null**（Walmart 行为）→ 用 `seller` 和 `inferredBrand`（标题首词）兜底
+- **第三方小品牌**（侵权排查主要场景）的 `sellerName` 通常 = 品牌名（实测 LaLuLa / AOLALA / NATYSWAN 都是这样）
+- **真正的品牌核对**用 `walmart_product_brand`：`brand` 字段在详情页 100% 可靠，且 `brandUrl` 就是你 prompt 里要的 `facet=brand:Xxx` 链接
+
+### dify 侵权排查 workflow 示例
+
+```text
+用户输入：商品标题 = "CNRATYE 20\" Modern Farmhouse Crystal Chandeliers ..."
+                     涉嫌侵权品牌 = "CNRATYE"
+
+步骤 1：调用 walmart_search_brief(query="CNRATYE Crystal Chandelier", topN=10)
+        → 拿到前 10 个商品的精简 JSON（含 seller 字段，~9 KB）
+
+步骤 2：LLM 判断
+        - 看 items[].seller 和 items[].inferredBrand
+        - 如果前 10 个 seller 里没有 "CNRATYE" → 直接判"未侵权"（最常见，1 次访问搞定）
+        - 如果有疑似 → 进入步骤 3
+
+步骤 3：对疑似商品调用 walmart_product_brand(itemId=...)
+        → 拿到详情页真实 brand + brandUrl
+        → LLM 比对 brand == "CNRATYE" 决定是否真的侵权
+```
+
+### 调用示例
+
+```jsonc
+// dify 工具调用
+{
+  "tool": "walmart_search_brief",
+  "args": { "query": "lalula chandelier", "topN": 10 }
+}
+// 返回：
+{
+  "ok": true,
+  "query": "lalula chandelier",
+  "url": "https://www.walmart.com/search?q=lalula%20chandelier",
+  "totalResults": 4,
+  "stacksCount": 1,
+  "parseSource": "next-data",
+  "items": [
+    {
+      "rank": 1,
+      "title": "4-Light Elegant Black Finish Plug-in Crystal Chandelier...",
+      "brand": null,
+      "inferredBrand": "Elegant",
+      "seller": "LaLuLa",            // ★ 第三方品牌 seller 通常 = 品牌名
+      "price": 50.95,
+      "priceDisplay": "$50.95",
+      "productUrl": "https://www.walmart.com/ip/.../3488989197?...",
+      "itemId": "3488989197",
+      "rating": 4.7,
+      "reviewCount": 36,
+      "sponsored": false,
+      "availability": "In stock",
+      "imageUrl": "https://i5.walmartimages.com/..."
+    }
+    // ... 共 10 条
+  ]
+}
+
+// 再调一次品牌核对：
+{
+  "tool": "walmart_product_brand",
+  "args": { "itemId": "3488989197" }
+}
+// 返回：
+{
+  "ok": true,
+  "brand": "LaLuLa",
+  "brandUrl": "https://www.walmart.com/browse/0?facet=brand:LaLuLa",   // ★ 这就是你要的链接
+  "seller": "LaLuLa",
+  "sellerLegalName": "GUANGZHOU SHI XI MA LA YA GUO JI MAO YI YOU XIAN GONG SI",
+  "title": "...",
+  "itemId": "3488989197",
+  "price": 50.95
+}
+```
+
+### 错误码
+
+所有新端点返回 `{ ok: false, errorCode, errorMessage, ... }`，错误码：
+
+| Code | 含义 | dify 该怎么办 |
+| --- | --- | --- |
+| `SERVICE_NOT_READY` | Chrome 还没起 / 服务还在 connecting | 等几秒重试，或通知运维双击 `start-chrome.bat` |
+| `PX_BLOCKED` | 落到 PerimeterX 验证页 | **立即停止后续调用**，通知人工去那个 Chrome 窗口手动过验证后调 `walmart_rewarmup` |
+| `NEXT_DATA_NOT_FOUND` | 页面没有 `__NEXT_DATA__`（罕见，可能 Walmart 改版）| 当作软失败，跳过 |
+| `EMPTY_RESULT` | 关键词查无结果 | 业务正常，不算错误 |
+| `PRODUCT_NOT_FOUND` | 详情页 `data.product` 缺失 | 当作软失败 |
+| `NAVIGATION_TIMEOUT` | 页面加载超时 | 网络抖动，可重试一次 |
+
+### 并发保护
+
+服务内部有**全局 mutex**串行化所有 walmart 访问，防止并发触发 PX。dify 即使多路并发调，所有请求会自动排队。
 
 ---
 
@@ -98,6 +208,14 @@ node src/server.js                  # 启动
 
 ## 3. 对外工具
 
+### v3.1 推荐（精简 JSON，省 token）
+| 工具 | 说明 |
+| --- | --- |
+| `walmart_search_brief` | `{ query, topN? }` → 前 N 个商品的精简 JSON（详见上文 ★ 章节） |
+| `walmart_search_brief_batch` | `{ queries[], topN?, intervalMinMs?, intervalMaxMs? }` → 批量搜索，内部串行 + 随机 sleep |
+| `walmart_product_brand` | `{ url? \| itemId? }` → 详情页 brand/brandUrl/seller |
+
+### v3.0 原有（返回完整 HTML，慎用）
 | 工具 | 说明 |
 | --- | --- |
 | `walmart_status` | 当前服务状态（养号完成？最近抓取被拦了吗？cookie 完不完整？） |

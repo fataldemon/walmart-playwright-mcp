@@ -8,3 +8,6 @@ server.pid
 
 # 持久化身份目录：里面有 cookies / history / fingerprint state，禁止入库
 user-data/
+
+# probe 脚本临时 dump 的大 JSON / HTML（仅本地调试用）
+tmp/
