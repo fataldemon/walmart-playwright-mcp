@@ -3,4 +3,8 @@
 .env
 server.log
 server.err
+server.pid
 .DS_Store
+
+# 持久化身份目录：里面有 cookies / history / fingerprint state，禁止入库
+user-data/

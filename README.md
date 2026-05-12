@@ -1,11 +1,50 @@
-# walmart-playwright-mcp
+# walmart-playwright-mcp · v2 持久化身份版
 
-一个**本地可部署**的 Playwright MCP 服务，专门用于绕过 **Walmart (PerimeterX / `_pxvid`) 人机验证**。
+> 一个**本地部署**的 Playwright MCP 服务，专门用于绕过 **Walmart (PerimeterX)** 的人机验证。
+> 通过 SSE 暴露在 `http://host.docker.internal:8931/sse`，可直接接入 Dify / Cline / Claude Desktop 等 MCP Client。
 
-方案参考：<https://www.iotword.com/33395.html>
-（核心：随机化指纹 HEAD 请求拿 `_pxvid` → 等 ~10s 生效 → 主/副令牌池轮转使用）
+## 1. 核心思路（v2 ≠ v1）
 
-本服务把这套思路 **MCP 化** —— 通过 SSE 暴露在 **`http://host.docker.internal:8931/sse`**，可直接被 Cline / Claude Desktop / 其它 MCP Client 接入。
+| | v1（参考 iotword.com/33395） | **v2（本仓库当前）** |
+| --- | --- | --- |
+| 主线 | 用 HTTP/HEAD 随机指纹批量造 `_pxvid` 令牌池 | **持久化 BrowserContext** + 本机 Chrome |
+| 身份载体 | 临时 `_pxvid` cookie | 整个 `./user-data/`（cookies + localStorage + fingerprint history） |
+| 反检测重点 | 随机 UA / sec-ch-ua | stealth plugin + **真人化行为**（贝塞尔鼠标 / 滚动 / 停顿） |
+| 启动后 | 池子常驻轮询，屏幕不断弹窗 | **启动跑一次 ~40s 养号**，之后只在收到请求时干活 |
+| 重启 | 全部 token 失效，重新刷 | **复用磁盘 user-data，无需重新养号** |
+| 适用 | 国外 IP + 文章假设的 PX 弱状态 | **本机能正常访问 walmart.com 的环境**（你的情况） |
+
+文章方案（v1）当时（2023）有效，但 2025 年的 PerimeterX 已经升级，单靠 `_pxvid` 几乎不行。v2 用"长期持有身份 + 行为模拟"代替"频繁刷 token"，更稳更安静。
+
+## 2. 部署
+
+### 2.1 前置条件
+- Node.js ≥ 18
+- 本机已安装 **Google Chrome**（默认路径：`C:\Program Files\Google\Chrome\Application\chrome.exe`）
+- **本机能正常打开 walmart.com**（不被弹蓝色 Robot or Human 拦截）
+- Playwright 自带 chromium 也要装一份做 fallback：`npx playwright install chromium`
+
+### 2.2 一键启动
+
+```powershell
+cd F:\GitRepository\walmart-playwright-mcp
+npm install                         # 首次
+npx playwright install chromium     # 首次
+copy .env.example .env              # 可选，按需改
+node src/server.js                  # 启动
+```
+
+启动时会发生：
+1. `[preflight] chromium executable OK: ...`
+2. 弹出 **Chrome 窗口**（用的是你本机 Chrome 二进制）
+3. 自动访问 walmart.com 首页，模拟人类行为 ~40 秒（鼠标自己飘、滚动、在搜索框试探性打字）
+4. 写入 `./user-data/`（cookies / storage）
+5. 日志 `[startup] ✅ warmup complete`
+6. **服务进入 ready 状态，开始接受 dify 调用**
+
+如果首次启动时遇到 Robot or Human 页面：**在弹出的窗口里手动按住"Press & Hold"按钮**，程序会自动检测到通过并继续。**之后多天/多周不需要再做这个操作**。
+
+### 2.3 MCP 客户端配置
 
 ```jsonc
 {
@@ -16,180 +55,77 @@
 }
 ```
 
----
-
-## 1. 架构
-
-```
-┌──────────────────────────────────────────────────────────┐
-│  MCP Client (Cline / Claude / Cursor ...)                │
-│        │   transport: sse                                │
-│        ▼                                                 │
-│  http://host.docker.internal:8931/sse                    │
-│        │                                                 │
-│ ┌──────┴────────────────── walmart-playwright-mcp ─────┐ │
-│ │  Express + @modelcontextprotocol/sdk (SSE)           │ │
-│ │  ┌────────────────────────┐    ┌──────────────────┐  │ │
-│ │  │  PxvidPool (undici)    │───▶│  Playwright +    │  │ │
-│ │  │  • 随机 UA / Sec-Ch-Ua │    │  stealth plugin  │  │ │
-│ │  │  • 主令牌 + 副令牌     │    │  • 注入 _pxvid   │  │ │
-│ │  │  • 10s 生效, TTL 30min │    │  • 渲染 / 抓取   │  │ │
-│ │  └────────────────────────┘    └──────────────────┘  │ │
-│ └──────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────┘
-```
-
----
-
-## 2. 提供的 MCP Tools
+## 3. 对外工具
 
 | 工具 | 说明 |
 | --- | --- |
-| `pxvid_stats` | 查看令牌池：`{ total, ready, avgAgeSec }` |
-| `pxvid_refresh` | 强制清空并重新生成一批令牌 |
-| `walmart_fetch` | 抓任意 `walmart.com` 页面（自动注入 `_pxvid`、被拦自动重试） |
-| `walmart_search` | `query` → 搜索结果 HTML |
-| `walmart_product` | `url` 或 `itemId` → 商品详情 HTML |
-| `playwright_goto` | 通用 stealth Playwright 抓取（非 walmart 域名） |
+| `walmart_status` | 当前服务状态（养号完成？最近抓取被拦了吗？cookie 完不完整？） |
+| `walmart_search` | `{ query, page? }` → 搜索结果 HTML |
+| `walmart_product` | `{ url? \| itemId? }` → 商品详情 HTML |
+| `walmart_fetch` | `{ url, responseType?, waitForSelector?, timeoutMs? }` → 通用抓取 |
+| `walmart_rewarmup` | 【调试】强制重跑一次养号（保留 user-data） |
+| `playwright_goto` | 【通用】stealth Playwright 抓任意域名 |
 
----
+> 强烈建议 dify 调用前先 `walmart_status` 看 `status==='ready'` 再调 `walmart_search` / `walmart_fetch`。
 
-## 3. 本地部署
-
-### 3.1 Docker（推荐）
-
-```bash
-# 构建并启动
-docker compose up -d --build
-
-# 查看日志
-docker compose logs -f walmart-playwright-mcp
-
-# 健康检查
-curl http://localhost:8931/healthz
-```
-
-容器启动后 ~10–20 秒令牌池就绪，可在 MCP 客户端用如下配置接入：
-
-```jsonc
-{
-  "playwright": {
-    "transport": "sse",
-    "url": "http://host.docker.internal:8931/sse"
-  }
-}
-```
-
-> Windows / Mac Docker Desktop 默认就支持 `host.docker.internal`。
-> Linux 上 `docker-compose.yml` 里加的 `extra_hosts: host-gateway` 也已经替你解决了。
-
-### 3.2 Node 直接运行（无 Docker）
-
-```bash
-cd walmart-playwright-mcp
-npm install
-npx playwright install chromium    # ★ 首次必跑，下载完整 chromium（不是 headless-shell）
-cp .env.example .env               # 改下端口/代理
-npm start
-```
-
-启动后同样监听 `http://localhost:8931/sse`。
-
-> ⚠️ **必须装"完整 chromium"，不是 `chromium-headless-shell`**。
-> 如果你启动时看到日志框框
-> ```
-> ║  Playwright chromium 浏览器未安装或路径丢失！                 ║
-> ║      npx playwright install chromium                          ║
-> ```
-> 直接按提示执行那条命令即可。原因：`HEADLESS=false` 想看到真实窗口必须用完整 chromium，否则
-> `browserType.launch: Executable doesn't exist`。
-
----
-
-## 4. 环境变量
+## 4. 关键 .env 配置
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `HOST` | `0.0.0.0` | 监听地址 |
-| `PORT` | `8931` | 监听端口（与连接端点 url 一致） |
-| `HEADLESS` | `true` | Playwright 无头模式 |
-| `PROXY` | _空_ | 代理 URL，强烈推荐配海外住宅 IP |
-| `PXVID_PRIMARY` | `5` | 主令牌数 |
-| `PXVID_SECONDARY` | `5` | 副令牌数（备用） |
-| `PXVID_ACTIVATION_MS` | `10000` | 令牌生成后多久才能用，文章实测 ~10s |
+| `PORT` | `8931` | SSE 端口 |
+| `USER_DATA_DIR` | `./user-data` | 身份目录（cookies/storage 落盘位置） |
+| `USE_LOCAL_CHROME` | `true` | 用本机 Chrome 二进制（最强反检测） |
+| `WARMUP_ON_START` | `true` | 启动时自动养号 |
+| `WARMUP_HEADLESS` | `false` | 养号窗口可见（便于手动救援 captcha） |
+| `SERVING_HEADLESS` | `false` | 抓取窗口可见 |
+| `MAINTENANCE_INTERVAL_MS` | `1800000` | 维护心跳访问频率（30 分钟） |
+| `PROXY` | _空_ | 代理 URL（仅在你本机 IP 受限时配置） |
 
----
-
-## 5. 文章方案在本项目中的落地点
-
-| 文章里的要点 | 代码位置 |
-| --- | --- |
-| 随机化 `User-Agent` / `Sec-Ch-Ua` / 自定义混淆头 | `src/pxvid-pool.js → buildRandomHeaders()` |
-| HEAD/GET 请求拿 `_pxvid` | `src/pxvid-pool.js → fetchOnePxvid()` |
-| 等 ~10s 才能用 | `PxvidPool.activationMs` → `setTimeout(ready=true, 10s)` |
-| 主令牌池 + 副令牌异步补充 | `PxvidPool._fill()` / `_loop()` |
-| 令牌过期/达上限即换 | `maxUsePerToken`, `ttlMs` |
-| IP 池 / 海外代理 | `PROXY` 环境变量（`undici.ProxyAgent` + Playwright `--proxy-server`） |
-
----
-
-## 6. 接入 MCP Client 后的用法示例
-
-让 LLM 调用：
+## 5. 状态机
 
 ```
-tool: walmart_search
-args: { "query": "airpods pro", "page": 1 }
+pending  ─启动→  warming  ─养号完成→  ready  ─dify 调用→  ready  (循环)
+                                       │
+                                       └ 收到 px-captcha → blocked → 手动过验证 → walmart_rewarmup → ready
 ```
 
-服务内部流程：
+## 6. 调试 / 验证
 
-1. `PxvidPool.acquire()` → 拿一个 `ready=true` 的 `_pxvid`；
-2. 起一个新的 stealth `BrowserContext`，注入 `_pxvid` cookie + 一致的 UA/客户端提示；
-3. 访问搜索页 → 等到 `[data-testid="item-stack"]` 出现 → 返回 HTML；
-4. 若识别到 "Robot or human?" / `px-captcha` → 自动换另一个 token 再试一次。
+```powershell
+# 看健康状态
+curl.exe -s http://localhost:8931/healthz
 
----
-
-## 7. 调试
-
-```bash
-# 看令牌池状态（增强版，含诊断信息）
-curl http://localhost:8931/healthz
+# 看 MCP 工具列表（需要 SSE 客户端，简单看可以用 scripts/test-connection.mjs）
+node scripts/test-connection.mjs
 ```
 
-返回示例：
-
+`/healthz` 示例返回：
 ```jsonc
 {
   "ok": true,
-  "pool": {
-    "total": 0, "ready": 0,
-    "attempts": 31, "successes": 0, "successRate": 0,
-    "lastStatus": 200,
-    "lastError": "no _pxvid in cookies (status 200)",
-    "proxyConfigured": false,
-    "hint": "池为空且未配置 PROXY。沃尔玛对中国大陆 IP 风控严格，请设置 PROXY=http://user:pass@host:port 后重启。"
-  }
+  "warmup": {
+    "status": "ready",
+    "firstRun": true,
+    "cookies": { "pxvid": true, "px3": true, "pxhd": true },
+    "fetchCount": 0, "blockedCount": 0
+  },
+  "persistent": { "running": true, "headless": false, "userDataDir": "F:\\...\\user-data" }
 }
 ```
 
-### ⚠️ 常见诊断 → 处置
+## 7. 常见问题
 
-| lastStatus | lastError 关键词 | 含义 | 解决 |
-| --- | --- | --- | --- |
-| `0` | `network: ENOTFOUND / ETIMEDOUT` | 出站连不上 walmart.com | 检查网络/代理 |
-| `200` | `no _pxvid in cookies` | 已连上但**沃尔玛对你的 IP 走匿名分流**，不下发 PerimeterX 指纹 | **必须配海外代理 `PROXY=...`** |
-| `403` / `429` | `no _pxvid in cookies` | IP 已被 PX 拉黑 | 换代理或换出口 |
-| `200` | `browser: no _pxvid cookie` | 浏览器 fallback 也没拿到 → 强地区限制 | 同上，海外住宅 IP 必备 |
+**Q: 重启服务是不是又要养号 40 秒？**
+A: 不会。只要 `./user-data/` 还在，重启时只跑 5-10 秒的"轻量验证"，cookies 全部复用。
 
-> 本服务内部对每次令牌生成会做 **两级 fallback**：
-> 1. 先用 `undici` 发 HTTP 请求拿 `Set-Cookie` 里的 `_pxvid`（快）；
-> 2. 拿不到再启 **stealth Playwright** 打开首页，让 PerimeterX 的 JS 自己种 `_pxvid` 后从 cookie 读出（慢但稳）。
->
-> 不管 HTTP 还是浏览器，**没有海外 IP 都是白搭** —— 这就是文章里强调"用海外 IP 池"的根本原因。
+**Q: 我能不能删掉 `./user-data/` 重来？**
+A: 可以，但是要小心：所有"老访客信用"会丢，下次首次养号时大概率被弹 captcha 要你手动过一次。
 
----
+**Q: 想跑无人值守 / 服务器部署怎么办？**
+A: 设置 `SERVING_HEADLESS=true`（抓取无头），`WARMUP_HEADLESS=true`（养号无头）。但**首次养号还是建议有图形界面**手动过一次 captcha，之后拷贝 `./user-data/` 到服务器，再设 `WARMUP_ON_START=true WARMUP_HEADLESS=true`，重启就秒进 ready。
+
+**Q: 文章里那个 `_pxvid` 令牌池代码还在吗？**
+A: 还在 `src/pxvid-pool.js`，但**不在主链路使用**了，server.js 默认不启动它。需要的时候可以单独 import 使用。
 
 ## 8. 法律 / 合规
 
