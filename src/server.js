@@ -19,8 +19,32 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 
+import { existsSync } from 'node:fs';
+import { chromium as pwBaseChromium } from 'playwright';
 import { PxvidPool } from './pxvid-pool.js';
 import { fetchWalmartPage, getBrowser, closeBrowser, getCurrentBrowserMode } from './browser.js';
+
+// 启动自检：Playwright 是否装了完整 chromium 可执行文件
+function preflightCheckChromium() {
+  try {
+    const exe = pwBaseChromium.executablePath();
+    if (!exe || !existsSync(exe)) {
+      console.error('');
+      console.error('╔══════════════════════════════════════════════════════════════╗');
+      console.error('║  Playwright chromium 浏览器未安装或路径丢失！                 ║');
+      console.error('║  请在项目目录执行：                                            ║');
+      console.error('║      npx playwright install chromium                          ║');
+      console.error('║  没有它，浏览器 fallback 将无法获取 _pxvid。                   ║');
+      console.error('╚══════════════════════════════════════════════════════════════╝');
+      console.error('');
+    } else {
+      console.log(`[preflight] chromium executable OK: ${exe}`);
+    }
+  } catch (e) {
+    console.warn('[preflight] cannot resolve chromium path:', e.message);
+  }
+}
+preflightCheckChromium();
 
 // ---------- 配置（运行时可变） ----------
 const PORT = parseInt(process.env.PORT || '8931', 10);

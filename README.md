@@ -88,12 +88,21 @@ curl http://localhost:8931/healthz
 ```bash
 cd walmart-playwright-mcp
 npm install
-npx playwright install chromium    # 第一次需下载浏览器
+npx playwright install chromium    # ★ 首次必跑，下载完整 chromium（不是 headless-shell）
 cp .env.example .env               # 改下端口/代理
 npm start
 ```
 
 启动后同样监听 `http://localhost:8931/sse`。
+
+> ⚠️ **必须装"完整 chromium"，不是 `chromium-headless-shell`**。
+> 如果你启动时看到日志框框
+> ```
+> ║  Playwright chromium 浏览器未安装或路径丢失！                 ║
+> ║      npx playwright install chromium                          ║
+> ```
+> 直接按提示执行那条命令即可。原因：`HEADLESS=false` 想看到真实窗口必须用完整 chromium，否则
+> `browserType.launch: Executable doesn't exist`。
 
 ---
 
