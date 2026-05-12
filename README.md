@@ -1,9 +1,50 @@
-# walmart-playwright-mcp · v2 持久化身份版
+# walmart-playwright-mcp · v3 CDP 接管版
 
 > 一个**本地部署**的 Playwright MCP 服务，专门用于绕过 **Walmart (PerimeterX)** 的人机验证。
 > 通过 SSE 暴露在 `http://host.docker.internal:8931/sse`，可直接接入 Dify / Cline / Claude Desktop 等 MCP Client。
 
-## 1. 核心思路（v2 ≠ v1）
+---
+
+## 🚀 快速开始（v3 推荐流程）
+
+```
+1. 双击 start-chrome.bat
+   → 弹出一个 Chrome 窗口，自动打开 walmart.com
+   → 在这个窗口里手动逛 2-3 分钟（搜个东西、点几个商品）
+   → 如果弹 "Press And Hold" 验证，手动按住一次
+   → **不要关这个 Chrome**，最小化即可
+
+2. 在 PowerShell 里启动服务：
+   cd F:\GitRepository\walmart-playwright-mcp
+   node src\server.js
+   → 看到 [startup] ✅ CDP connected 就 OK 了
+
+3. dify 那边直接调 walmart_search / walmart_fetch ...
+   → 程序在那个 Chrome 里新开 tab 抓取
+   → PX 完全识别不出来是自动化（浏览器是真人启动的，只是被附加控制）
+```
+
+> 重启服务不需要重新 1，只要 Chrome 还开着就 OK。重启 Chrome 也只需重做第 1 步（cookies 已落盘在 `./user-data/`，不会重复弹验证）。
+
+---
+
+## 0. 为什么是 CDP（v3 ≠ v2）
+
+| 版本 | 反爬主线 | 实战效果 |
+| --- | --- | --- |
+| v1 | iotword.com/33395：HTTP 刷 `_pxvid` 令牌池 | 2025 年 PX 已升级，**失效** |
+| v2 | Playwright `launchPersistentContext` + stealth + 本机 Chrome | **一打开就被识破**，PX 立刻判 high-risk |
+| **v3 (当前)** | **chromium.connectOverCDP()** 接管你手动启动的 Chrome | **PX 完全看不出** |
+
+### 为什么 v3 能成？
+PX 检测自动化的核心信号是 **"浏览器是被 CDP _启动_ 的"**（CDP 启动 vs CDP 附加是两种完全不同的指纹）。
+
+- v2：Playwright 用 `--remote-debugging-pipe` 启动 Chrome → 命令行里有 `--enable-automation` → PX 看出来
+- v3：你手动用 `--remote-debugging-port=9222` 启动 Chrome → 命令行**完全干净** → Playwright 只是"附加上去看看"→ PX 完全看不出区别
+
+---
+
+## 1. 核心思路（v2 vs v1 历史对比，保留参考）
 
 | | v1（参考 iotword.com/33395） | **v2（本仓库当前）** |
 | --- | --- | --- |

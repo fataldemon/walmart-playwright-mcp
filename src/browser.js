@@ -12,7 +12,136 @@ import { humanize } from './humanize.js';
 // 把所有 stealth evasions 装到 playwright-extra 上
 pwChromium.use(StealthPlugin());
 
-// ============ 1) 持久化 Context（主线） ============
+// ============ 0) CDP 接管模式（推荐主线，绕 PX 最强方案） ============
+// 用户先用 start-chrome.bat 启动一个 Chrome（--remote-debugging-port=9222），
+// 我们用 chromium.connectOverCDP() 附加到它上面。
+// PerimeterX 看不出来这个 Chrome 被自动化控制，因为它本来就是用户手动启动的。
+
+let _cdpBrowser = null;
+let _cdpContext = null;
+let _cdpUrl = null;
+
+/** 等待 CDP 端口可用 */
+async function waitForCdp(cdpUrl, timeoutMs = 5000) {
+  const start = Date.now();
+  // CDP 通过 HTTP 暴露 /json/version 端点
+  const versionUrl = cdpUrl.replace(/\/$/, '') + '/json/version';
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const res = await fetch(versionUrl);
+      if (res.ok) return true;
+    } catch {}
+    await new Promise(r => setTimeout(r, 300));
+  }
+  return false;
+}
+
+/** 接管已启动的 Chrome（用 chromium.connectOverCDP） */
+export async function connectToExistingChrome({ cdpUrl = 'http://localhost:9222', logger = console } = {}) {
+  if (_cdpBrowser && _cdpBrowser.isConnected()) return _cdpContext;
+
+  logger.log?.(`[cdp] checking ${cdpUrl}/json/version ...`);
+  const ready = await waitForCdp(cdpUrl, 5000);
+  if (!ready) {
+    throw new Error(
+      `CDP endpoint ${cdpUrl} not reachable. 请先双击 start-chrome.bat 启动 Chrome（带 --remote-debugging-port=9222）`
+    );
+  }
+
+  logger.log?.(`[cdp] connecting to ${cdpUrl} ...`);
+  _cdpBrowser = await pwChromium.connectOverCDP(cdpUrl);
+  _cdpUrl = cdpUrl;
+
+  // 现存的 default context 就是用户手动启动 Chrome 时打开的那个
+  const contexts = _cdpBrowser.contexts();
+  if (contexts.length === 0) {
+    throw new Error('CDP connected but no existing contexts found (unexpected)');
+  }
+  _cdpContext = contexts[0];
+
+  // 反检测注入仍然加上（不会有副作用，且对新开 tab 生效）
+  await _cdpContext.addInitScript(() => {
+    try {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    } catch {}
+    try { window.chrome = window.chrome || { runtime: {} }; } catch {}
+  }).catch(() => {});
+
+  const pages = _cdpContext.pages();
+  logger.log?.(`[cdp] connected ✅ contexts=${contexts.length} pages=${pages.length}`);
+  return _cdpContext;
+}
+
+/** 关闭 CDP 连接（不会关闭用户的 Chrome 窗口，只是断开附加） */
+export async function disconnectCdp() {
+  if (_cdpBrowser) {
+    try { await _cdpBrowser.close(); } catch {} // close() 在 CDP mode 等于 disconnect，不会杀 Chrome
+    _cdpBrowser = null;
+    _cdpContext = null;
+  }
+}
+
+export function getCdpInfo() {
+  return {
+    connected: !!(_cdpBrowser && _cdpBrowser.isConnected()),
+    cdpUrl: _cdpUrl,
+    pages: _cdpContext?.pages?.()?.length ?? 0,
+  };
+}
+
+/** CDP 模式下抓 Walmart 页面 */
+export async function fetchWalmartPageCdp({
+  url,
+  cdpUrl = 'http://localhost:9222',
+  responseType = 'html',
+  waitForSelector = null,
+  timeoutMs = 60_000,
+  logger = console,
+}) {
+  const context = await connectToExistingChrome({ cdpUrl, logger });
+  const page = await context.newPage();
+  page.setDefaultTimeout(timeoutMs);
+
+  try {
+    const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    const status = resp ? resp.status() : 0;
+
+    // 着陆后跑一遍人类化（鼠标 + 滚动 + 停顿）
+    await humanize.afterLand(page);
+
+    const isBlocked = await page.evaluate(() => {
+      const t = (document.title || '').toLowerCase();
+      const b = (document.body?.innerText || '').slice(0, 600).toLowerCase();
+      return /robot or human|verify you are|access denied|px-captcha|are you a human|press (?:and|&) hold/.test(t + ' ' + b);
+    }).catch(() => false);
+
+    if (waitForSelector && !isBlocked) {
+      await page.waitForSelector(waitForSelector, { timeout: timeoutMs }).catch(() => {});
+    }
+
+    let data;
+    if (responseType === 'json') {
+      const txt = await page.evaluate(() => document.body.innerText);
+      try { data = JSON.parse(txt); } catch { data = { raw: txt }; }
+    } else if (responseType === 'text') {
+      data = await page.evaluate(() => document.body.innerText);
+    } else {
+      data = await page.content();
+    }
+
+    return {
+      ok: !isBlocked && status >= 200 && status < 400,
+      status,
+      blocked: isBlocked,
+      url: page.url(),
+      data,
+    };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+// ============ 1) 持久化 Context（v2 老主线，保留做 fallback） ============
 let _persistent = null;             // { context, headless, userDataDir }
 let _maintenanceTimer = null;
 

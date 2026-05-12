@@ -1,17 +1,17 @@
 #!/usr/bin/env node
-// server.js —— Playwright MCP（Walmart 反人机 · 持久化身份版）
+// server.js —— Playwright MCP（Walmart 反人机 · CDP 接管版 v3）
 //
-// 思路：
-//   - 启动时自动用本机 Chrome（channel:'chrome'）打开一个 persistent context（./user-data/），
-//     模拟"真人闲逛"30~60s 让 PerimeterX 把我们打成 high-trust 用户。
-//   - 之后所有 walmart_* 调用都复用同一个 context（cookies/storage 落盘，重启不丢）。
-//   - 每次抓取都跑 humanize（鼠标贝塞尔轨迹 + 滚动 + 随机停顿）。
-//   - 后台每 30 分钟做一次 "heartbeat visit" 保持身份活跃。
+// 反爬主线：CDP 接管模式
+//   1. 用户先双击 start-chrome.bat → 启动一个 Chrome（带 --remote-debugging-port=9222）
+//      并手动逛 walmart.com 2-3 分钟养号（如果弹 Press&Hold 就手动按一次）
+//   2. 服务启动 → chromium.connectOverCDP('http://localhost:9222') 接管这个 Chrome
+//   3. dify 调用 walmart_* → 在那个 Chrome 里新开 tab 抓取，PX 完全识别不出自动化
 //
-// 暴露给 dify / MCP 客户端的工具（简洁版，4 个）：
+// 备选模式（MODE=persistent）：保留 v2 的 launchPersistentContext 流程做 fallback
+//
+// 暴露给 dify 的工具（4 个）：
 //   walmart_search   walmart_product   walmart_fetch   walmart_status
-//
-// 另外保留两个调试工具（不希望 dify 调，但人可以 curl）：
+// 调试工具：
 //   playwright_goto  walmart_rewarmup
 
 import path from 'node:path';
@@ -26,6 +26,12 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 
 import {
+  // CDP
+  connectToExistingChrome,
+  disconnectCdp,
+  getCdpInfo,
+  fetchWalmartPageCdp,
+  // persistent fallback
   getPersistentContext,
   closePersistent,
   getCurrentPersistentInfo,
@@ -33,25 +39,31 @@ import {
   startMaintenance,
   isWarmedUp,
   fetchWalmartPagePersistent,
+  // 通用
   getBrowser,
   closeBrowser,
 } from './browser.js';
-import { humanize } from './humanize.js';
 
 // ---------- 配置 ----------
 const PORT = parseInt(process.env.PORT || '8931', 10);
 const HOST = process.env.HOST || '0.0.0.0';
 const PROXY = process.env.PROXY || null;
+
+const MODE = (process.env.MODE || 'cdp').toLowerCase();     // cdp | persistent
+const CDP_URL = process.env.CDP_URL || 'http://localhost:9222';
+const CDP_AUTO_RECONNECT_MS = parseInt(process.env.CDP_AUTO_RECONNECT_MS || '5000', 10);
+
 const USER_DATA_DIR = path.resolve(process.env.USER_DATA_DIR || './user-data');
 const USE_LOCAL_CHROME = process.env.USE_LOCAL_CHROME !== 'false';
 const WARMUP_ON_START = process.env.WARMUP_ON_START !== 'false';
-const WARMUP_HEADLESS = process.env.WARMUP_HEADLESS === 'true';      // 默认 false：显示窗口
-const SERVING_HEADLESS = process.env.SERVING_HEADLESS === 'true';    // 默认 false：显示窗口
+const WARMUP_HEADLESS = process.env.WARMUP_HEADLESS === 'true';
+const SERVING_HEADLESS = process.env.SERVING_HEADLESS === 'true';
 const MAINTENANCE_INTERVAL_MS = parseInt(process.env.MAINTENANCE_INTERVAL_MS || `${30 * 60_000}`, 10);
 
 // 运行时状态
-let warmupState = {
-  status: 'pending',      // pending | warming | ready | blocked | error
+let state = {
+  mode: MODE,
+  status: 'pending',      // pending | connecting | warming | ready | blocked | error
   startedAt: null,
   finishedAt: null,
   firstRun: null,
@@ -66,15 +78,14 @@ let warmupState = {
 // ---------- MCP server 工厂 ----------
 function buildMcpServer() {
   const server = new Server(
-    { name: 'walmart-playwright-mcp', version: '2.0.0' },
+    { name: 'walmart-playwright-mcp', version: '3.0.0' },
     { capabilities: { tools: {} } }
   );
 
   const tools = [
     {
       name: 'walmart_status',
-      description:
-        '查看 Walmart 抓取服务当前是否就绪（养号完成 / PX cookie 是否齐全 / 最近抓取是否被拦）',
+      description: '查看 Walmart 抓取服务当前是否就绪',
       inputSchema: { type: 'object', properties: {} },
     },
     {
@@ -102,8 +113,7 @@ function buildMcpServer() {
     },
     {
       name: 'walmart_fetch',
-      description:
-        '使用持久化身份抓取任意 walmart.com 页面（会注入老用户 cookies + 模拟人类行为）',
+      description: '抓取任意 walmart.com 页面',
       inputSchema: {
         type: 'object',
         properties: {
@@ -115,15 +125,14 @@ function buildMcpServer() {
         required: ['url'],
       },
     },
-    // 调试用
     {
       name: 'walmart_rewarmup',
-      description: '【调试】强制重新跑一次养号流程（不会删除 ./user-data/）',
+      description: '【调试】CDP 模式下重连 Chrome；persistent 模式下强制重跑养号',
       inputSchema: { type: 'object', properties: {} },
     },
     {
       name: 'playwright_goto',
-      description: '【通用】stealth Playwright 抓取（任意域名，不走持久化身份）',
+      description: '【通用】stealth Playwright 抓取任意域名（不走 walmart 主链路）',
       inputSchema: {
         type: 'object',
         properties: {
@@ -144,18 +153,21 @@ function buildMcpServer() {
       switch (name) {
         case 'walmart_status':
           return ok({
-            ...warmupState,
-            userDataDir: USER_DATA_DIR,
-            userDataExists: existsSync(USER_DATA_DIR),
-            warmedUpOnDisk: isWarmedUp(USER_DATA_DIR),
-            persistent: getCurrentPersistentInfo(),
+            ...state,
             config: {
+              mode: MODE, cdpUrl: CDP_URL,
+              userDataDir: USER_DATA_DIR,
               useLocalChrome: USE_LOCAL_CHROME,
+              warmupOnStart: WARMUP_ON_START,
               warmupHeadless: WARMUP_HEADLESS,
               servingHeadless: SERVING_HEADLESS,
               maintenanceIntervalMin: Math.round(MAINTENANCE_INTERVAL_MS / 60_000),
               proxy: PROXY,
             },
+            cdp: getCdpInfo(),
+            persistent: getCurrentPersistentInfo(),
+            userDataExists: existsSync(USER_DATA_DIR),
+            warmedUpOnDisk: isWarmedUp(USER_DATA_DIR),
           });
 
         case 'walmart_search': {
@@ -164,10 +176,9 @@ function buildMcpServer() {
             page: z.number().int().min(1).default(1),
           }).parse(args);
           const url = `https://www.walmart.com/search?q=${encodeURIComponent(a.query)}&page=${a.page}`;
-          const result = await safeFetch(url, {
+          return ok(await safeFetch(url, {
             waitForSelector: '[data-testid="item-stack"], [data-item-id]',
-          });
-          return ok(result);
+          }));
         }
 
         case 'walmart_product': {
@@ -176,10 +187,7 @@ function buildMcpServer() {
             itemId: z.string().optional(),
           }).refine(v => v.url || v.itemId, { message: 'url or itemId required' }).parse(args);
           const url = a.url || `https://www.walmart.com/ip/${a.itemId}`;
-          const result = await safeFetch(url, {
-            waitForSelector: 'h1, [itemprop="name"]',
-          });
-          return ok(result);
+          return ok(await safeFetch(url, { waitForSelector: 'h1, [itemprop="name"]' }));
         }
 
         case 'walmart_fetch': {
@@ -189,30 +197,33 @@ function buildMcpServer() {
             waitForSelector: z.string().optional(),
             timeoutMs: z.number().default(60000),
           }).parse(args);
-          const result = await safeFetch(a.url, {
+          return ok(await safeFetch(a.url, {
             responseType: a.responseType,
             waitForSelector: a.waitForSelector,
             timeoutMs: a.timeoutMs,
-          });
-          return ok(result);
+          }));
         }
 
         case 'walmart_rewarmup': {
-          warmupState.status = 'warming';
-          warmupState.startedAt = new Date().toISOString();
-          warmupState.error = null;
-          const r = await runWarmup({
-            userDataDir: USER_DATA_DIR,
-            headless: WARMUP_HEADLESS,
-            proxy: PROXY,
-            useLocalChrome: USE_LOCAL_CHROME,
-          });
-          warmupState.finishedAt = new Date().toISOString();
-          warmupState.firstRun = r.firstRun;
-          warmupState.cookies = r.cookies;
-          warmupState.status = r.warmed && r.cookies?.pxvid ? 'ready' : 'blocked';
-          if (!r.warmed) { warmupState.status = 'error'; warmupState.error = r.error; }
-          return ok(warmupState);
+          if (MODE === 'cdp') {
+            await disconnectCdp();
+            await connectToExistingChrome({ cdpUrl: CDP_URL });
+            state.status = 'ready';
+            return ok({ ok: true, mode: 'cdp', cdp: getCdpInfo() });
+          } else {
+            state.status = 'warming';
+            const r = await runWarmup({
+              userDataDir: USER_DATA_DIR,
+              headless: WARMUP_HEADLESS,
+              proxy: PROXY,
+              useLocalChrome: USE_LOCAL_CHROME,
+            });
+            state.firstRun = r.firstRun;
+            state.cookies = r.cookies;
+            state.status = r.warmed && r.cookies?.pxvid ? 'ready' : 'blocked';
+            if (!r.warmed) { state.status = 'error'; state.error = r.error; }
+            return ok(state);
+          }
         }
 
         case 'playwright_goto': {
@@ -247,67 +258,64 @@ function buildMcpServer() {
   return server;
 }
 
-/** 统一的"安全抓取"入口：状态机管理 + 自动重试 + 被拦时尝试 rewarmup */
+/** 统一抓取入口（按 MODE 路由） */
 async function safeFetch(url, { responseType = 'html', waitForSelector = null, timeoutMs = 60000 } = {}) {
-  if (warmupState.status !== 'ready') {
+  if (state.status !== 'ready') {
     return {
-      ok: false,
-      blocked: false,
-      error: `service not ready (warmup status=${warmupState.status}). 请等待养号完成或调用 walmart_rewarmup`,
+      ok: false, blocked: false,
+      error: `service not ready (status=${state.status}, mode=${MODE}). ${
+        MODE === 'cdp'
+          ? '请确保已经双击 start-chrome.bat 启动了 Chrome，然后调用 walmart_rewarmup 重连。'
+          : '请等待 warmup 完成或调用 walmart_rewarmup。'
+      }`,
     };
   }
-  warmupState.fetchCount += 1;
-  const result = await fetchWalmartPagePersistent({
-    url,
-    userDataDir: USER_DATA_DIR,
-    headless: SERVING_HEADLESS,
-    proxy: PROXY,
-    useLocalChrome: USE_LOCAL_CHROME,
-    responseType,
-    waitForSelector,
-    timeoutMs,
-  });
+  state.fetchCount += 1;
+
+  let result;
+  if (MODE === 'cdp') {
+    result = await fetchWalmartPageCdp({ url, cdpUrl: CDP_URL, responseType, waitForSelector, timeoutMs });
+  } else {
+    result = await fetchWalmartPagePersistent({
+      url, userDataDir: USER_DATA_DIR, headless: SERVING_HEADLESS,
+      proxy: PROXY, useLocalChrome: USE_LOCAL_CHROME,
+      responseType, waitForSelector, timeoutMs,
+    });
+  }
+
   if (result.blocked) {
-    warmupState.blockedCount += 1;
-    warmupState.lastFetchBlockedAt = new Date().toISOString();
-    warmupState.lastFetchOk = false;
-    warmupState.status = 'blocked';
+    state.blockedCount += 1;
+    state.lastFetchBlockedAt = new Date().toISOString();
+    state.lastFetchOk = false;
+    state.status = 'blocked';
     return {
       ...result,
-      hint: '检测到 PerimeterX 校验。请在弹出的浏览器窗口里手动过一次验证，然后调用 walmart_rewarmup',
+      hint: MODE === 'cdp'
+        ? '检测到 PerimeterX 挑战。请到那个 Chrome 窗口手动过一次验证，然后调用 walmart_rewarmup'
+        : '检测到 PerimeterX 挑战。请到弹出窗口手动验证后调用 walmart_rewarmup',
     };
   }
-  warmupState.lastFetchOk = result.ok;
+  state.lastFetchOk = result.ok;
   return result;
 }
 
-function ok(payload) {
-  return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
-}
-function err(msg) {
-  return { isError: true, content: [{ type: 'text', text: `ERROR: ${msg}` }] };
-}
+function ok(payload) { return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] }; }
+function err(msg)    { return { isError: true, content: [{ type: 'text', text: `ERROR: ${msg}` }] }; }
 
 // ---------- SSE HTTP 层 ----------
 const app = express();
 app.use(express.json({ limit: '4mb' }));
-
 const transports = new Map();
 
 app.get('/', (_req, res) => {
-  res.json({
-    name: 'walmart-playwright-mcp',
-    version: '2.0.0',
-    transport: 'sse',
-    sse: '/sse',
-    messages: '/messages',
-    warmup: warmupState,
-  });
+  res.json({ name: 'walmart-playwright-mcp', version: '3.0.0', transport: 'sse', sse: '/sse', state });
 });
 
 app.get('/healthz', (_req, res) => res.json({
   ok: true,
-  warmup: warmupState,
+  mode: MODE,
+  state,
+  cdp: getCdpInfo(),
   persistent: getCurrentPersistentInfo(),
 }));
 
@@ -328,26 +336,60 @@ app.post('/messages', async (req, res) => {
 
 // ---------- 启动序列 ----------
 (async () => {
-  console.log(`[walmart-playwright-mcp] starting...`);
-  console.log(`[config] userDataDir=${USER_DATA_DIR}  useLocalChrome=${USE_LOCAL_CHROME}  warmupHeadless=${WARMUP_HEADLESS}  servingHeadless=${SERVING_HEADLESS}  proxy=${PROXY || '<none>'}`);
+  console.log(`[walmart-playwright-mcp] starting v3.0.0...`);
+  console.log(`[config] mode=${MODE}  cdpUrl=${CDP_URL}  userDataDir=${USER_DATA_DIR}`);
 
-  // ① 先把 HTTP 起来（这样 dify 即使在养号期间连过来也能拿到 walmart_status）
   app.listen(PORT, HOST, () => {
     console.log(`[walmart-playwright-mcp] listening on http://${HOST}:${PORT}`);
     console.log(`[walmart-playwright-mcp] MCP SSE endpoint:  http://${HOST}:${PORT}/sse`);
-    console.log(`[walmart-playwright-mcp] /healthz available immediately. walmart_* tools will refuse calls until warmup is ready.`);
   });
 
-  // ② 然后异步跑养号
+  if (MODE === 'cdp') {
+    await startCdpMode();
+  } else {
+    await startPersistentMode();
+  }
+})();
+
+async function startCdpMode() {
+  state.status = 'connecting';
+  state.startedAt = new Date().toISOString();
+  console.log(`[startup] MODE=cdp → 尝试连接 ${CDP_URL}`);
+
+  while (true) {
+    try {
+      await connectToExistingChrome({ cdpUrl: CDP_URL });
+      state.status = 'ready';
+      state.finishedAt = new Date().toISOString();
+      console.log(`[startup] ✅ CDP connected. Server is now serving walmart_*`);
+      console.log(`[startup] **重要**：不要关闭那个 Chrome 窗口，它就是我们的"身份载体"`);
+      break;
+    } catch (e) {
+      state.status = 'pending';
+      state.error = e.message;
+      console.error('');
+      console.error('╔══════════════════════════════════════════════════════════════╗');
+      console.error('║  无法连接到 Chrome 调试端口！                                  ║');
+      console.error('║  请先双击项目根目录下的：  start-chrome.bat                    ║');
+      console.error('║  然后等待 Chrome 启动，在 walmart.com 手动逛 2-3 分钟          ║');
+      console.error('║  (如果弹 Press And Hold 验证，手动按住完成它即可)              ║');
+      console.error('║  我会每 5 秒自动重试一次连接，无需重启此服务。                 ║');
+      console.error('╚══════════════════════════════════════════════════════════════╝');
+      console.error('');
+      await new Promise(r => setTimeout(r, CDP_AUTO_RECONNECT_MS));
+    }
+  }
+}
+
+async function startPersistentMode() {
   if (!WARMUP_ON_START) {
-    warmupState.status = 'ready';
-    console.log('[startup] WARMUP_ON_START=false → skipping warmup, server enters ready directly (untested!)');
+    state.status = 'ready';
+    console.log('[startup] WARMUP_ON_START=false → skipping warmup');
     return;
   }
-
-  warmupState.status = 'warming';
-  warmupState.startedAt = new Date().toISOString();
-  console.log('[startup] running warmup ...');
+  state.status = 'warming';
+  state.startedAt = new Date().toISOString();
+  console.log('[startup] MODE=persistent → running warmup...');
   try {
     const r = await runWarmup({
       userDataDir: USER_DATA_DIR,
@@ -355,36 +397,32 @@ app.post('/messages', async (req, res) => {
       proxy: PROXY,
       useLocalChrome: USE_LOCAL_CHROME,
     });
-    warmupState.finishedAt = new Date().toISOString();
-    warmupState.firstRun = r.firstRun;
-    warmupState.cookies = r.cookies;
+    state.finishedAt = new Date().toISOString();
+    state.firstRun = r.firstRun;
+    state.cookies = r.cookies;
     if (r.warmed && r.cookies?.pxvid) {
-      warmupState.status = 'ready';
-      console.log(`[startup] ✅ warmup complete (firstRun=${r.firstRun}). Server is now serving walmart_*`);
-    } else if (r.warmed) {
-      warmupState.status = 'blocked';
-      console.warn(`[startup] ⚠ warmup finished but PX cookies incomplete. Service marked as blocked. Try walmart_rewarmup after manually clearing captcha.`);
-    } else {
-      warmupState.status = 'error';
-      warmupState.error = r.error;
-      console.error(`[startup] ✗ warmup failed: ${r.error}`);
-    }
-
-    // ③ 开启维护轮询
-    if (warmupState.status === 'ready') {
+      state.status = 'ready';
+      console.log(`[startup] ✅ warmup complete (firstRun=${r.firstRun})`);
       startMaintenance({ intervalMs: MAINTENANCE_INTERVAL_MS });
-      console.log(`[startup] maintenance heartbeat scheduled every ${Math.round(MAINTENANCE_INTERVAL_MS / 60_000)} min`);
+    } else if (r.warmed) {
+      state.status = 'blocked';
+      console.warn('[startup] ⚠ warmup finished but PX cookies incomplete');
+    } else {
+      state.status = 'error';
+      state.error = r.error;
+      console.error('[startup] ✗ warmup failed:', r.error);
     }
   } catch (e) {
-    warmupState.status = 'error';
-    warmupState.error = e.message;
+    state.status = 'error';
+    state.error = e.message;
     console.error('[startup] warmup exception:', e);
   }
-})();
+}
 
 // ---------- 优雅退出 ----------
 async function shutdown() {
   console.log('[walmart-playwright-mcp] shutting down...');
+  await disconnectCdp();          // CDP 模式：仅断开附加，不杀 Chrome
   await closePersistent();
   await closeBrowser();
   setTimeout(() => process.exit(0), 1000).unref();
