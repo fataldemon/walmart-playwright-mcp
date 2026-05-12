@@ -1,0 +1,27 @@
+services:
+  walmart-playwright-mcp:
+    build: .
+    image: walmart-playwright-mcp:latest
+    container_name: walmart-playwright-mcp
+    restart: unless-stopped
+    ports:
+      - "8931:8931"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8931
+      HEADLESS: "true"
+      # 可选：海外代理（强烈推荐用于规模化采集）
+      # PROXY: "http://user:pass@proxy.example.com:8080"
+      PXVID_PRIMARY: "5"
+      PXVID_SECONDARY: "5"
+      PXVID_ACTIVATION_MS: "10000"
+    # 共享内存调大，防止 chromium 崩
+    shm_size: "1gb"
+    # 让 Docker 容器内可以通过 host.docker.internal 访问宿主机（Linux 上需要）
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8931/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

@@ -1,0 +1,29 @@
+{
+  "name": "walmart-playwright-mcp",
+  "version": "1.0.0",
+  "description": "Local Playwright MCP server with Walmart PerimeterX (_pxvid) bypass, exposed via SSE on port 8931",
+  "type": "module",
+  "main": "src/server.js",
+  "bin": {
+    "walmart-playwright-mcp": "src/server.js"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "install-browsers": "playwright install chromium"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "@playwright/test": "^1.48.0",
+    "express": "^4.19.2",
+    "playwright": "^1.48.0",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "undici": "^6.19.8",
+    "user-agents": "^1.1.349",
+    "zod": "^3.23.8"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
